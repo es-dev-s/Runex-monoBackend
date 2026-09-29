@@ -1,0 +1,13 @@
+/data
+.vault-root
+*.exe
+/tmp
+.env
+!.env.example
+*.pem
+*.log
+.DS_Store
+
+# Saved browser copy of the dashboard, not source
+/Projects · Runex.html
+/Projects · Runex_files/
