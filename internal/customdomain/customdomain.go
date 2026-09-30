@@ -2,17 +2,17 @@
 // they must create, and checks those records before Runex starts routing.
 //
 // A hostname is never routed until the TXT ownership token is present. The
-// CNAME/ALIAS (or flattened A/AAAA match) is required before status=active so
+// CNAME (or a flattened A/AAAA match) is required before status=active so
 // a verified-but-unpointed domain cannot steal traffic from another site.
 package customdomain
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -212,8 +212,10 @@ func SplitZone(hostname string) (label, zone string, apex bool) {
 	return strings.Join(parts[:len(parts)-2], "."), strings.Join(parts[len(parts)-2:], "."), false
 }
 
-// Records are the unique DNS instructions for one hostname. TXT proves
-// ownership; CNAME/ALIAS points the name at Runex's edge.
+// Records are the DNS rows a provider form actually has. TXT proves
+// ownership. A subdomain routes with CNAME. A root domain uses that same
+// CNAME when the provider allows it (Cloudflare does), or A and AAAA from
+// AddressRecords when it does not.
 func Records(hostname, token, cnameTarget string) []Record {
 	hostname = strings.ToLower(strings.TrimSpace(hostname))
 	token = strings.TrimSpace(token)
@@ -230,32 +232,78 @@ func Records(hostname, token, cnameTarget string) []Record {
 		Value:    token,
 		Purpose:  "verify",
 		Required: true,
-		Hint:     "Proves you control this domain. Runex will not route until this matches.",
+		Hint:     "Type TXT. Name is the host above. Paste the value exactly.",
 	}}
 	if cnameTarget == "" {
 		return out
 	}
+	host := label
+	hint := "Type CNAME. Name is the host above, target is this value. On Cloudflare, leave the proxy on (orange cloud)."
 	if apex {
-		out = append(out, Record{
-			Type:     "ALIAS",
-			Host:     "@",
-			Name:     hostname,
-			Value:    cnameTarget,
-			Purpose:  "route",
-			Required: true,
-			Hint:     "Apex names cannot use a CNAME. Use ALIAS, ANAME, or Cloudflare CNAME flattening (Proxied) to this target. Runex authorizes the name so it works from any DNS provider.",
-		})
-		return out
+		host = "@"
+		hint = "Type CNAME, name @. Cloudflare allows this on the root and should stay proxied. If your provider rejects a CNAME on @, add the A and AAAA records instead. ALIAS or ANAME, where you see them, use this same target."
 	}
 	out = append(out, Record{
 		Type:     "CNAME",
-		Host:     label,
+		Host:     host,
 		Name:     hostname,
 		Value:    cnameTarget,
 		Purpose:  "route",
 		Required: true,
-		Hint:     "In Cloudflare, use a Proxied (orange cloud) CNAME to this target. Runex authorizes it so Error 1014 does not appear.",
+		Hint:     hint,
 	})
+	return out
+}
+
+// AddressRecords are the A and AAAA rows for a root domain whose DNS
+// provider has no CNAME on @. Subdomains do not need them.
+func AddressRecords(hostname string, v4, v6 []string) []Record {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	_, _, apex := SplitZone(hostname)
+	if !apex {
+		return nil
+	}
+	var out []Record
+	for _, ip := range uniqueIPs(v4) {
+		out = append(out, Record{
+			Type:     "A",
+			Host:     "@",
+			Name:     hostname,
+			Value:    ip,
+			Purpose:  "route",
+			Required: false,
+			Hint:     "Add this A record only when a CNAME on @ is not allowed.",
+		})
+	}
+	for _, ip := range uniqueIPs(v6) {
+		out = append(out, Record{
+			Type:     "AAAA",
+			Host:     "@",
+			Name:     hostname,
+			Value:    ip,
+			Purpose:  "route",
+			Required: false,
+			Hint:     "Add this AAAA record only when a CNAME on @ is not allowed.",
+		})
+	}
+	return out
+}
+
+func uniqueIPs(raw []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, item := range raw {
+		parsed := net.ParseIP(strings.TrimSpace(item))
+		if parsed == nil {
+			continue
+		}
+		key := parsed.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
 	return out
 }
 
@@ -303,12 +351,12 @@ func Verify(ctx context.Context, resolver Resolver, hostname, token string, cnam
 		defer cancel()
 	}
 	out := Check{}
-	txt, err := resolver.LookupTXT(ctx, ChallengeName(hostname))
+	txt, err := lookupTXT(ctx, resolver, ChallengeName(hostname))
 	if err == nil && TXTMatch(txt, token) {
 		out.TXT = true
 	}
 	if !out.TXT {
-		if extra, extraErr := resolver.LookupTXT(ctx, hostname); extraErr == nil && TXTMatch(extra, token) {
+		if extra, extraErr := lookupTXT(ctx, resolver, hostname); extraErr == nil && TXTMatch(extra, token) {
 			out.TXT = true
 		}
 	}
@@ -318,18 +366,116 @@ func Verify(ctx context.Context, resolver Resolver, hostname, token string, cnam
 	} else {
 		out.Route = pointsAt(ctx, resolver, hostname, targets)
 	}
+	_, _, apex := SplitZone(hostname)
+	shown := ""
+	if len(targets) > 0 {
+		shown = targets[0]
+	}
 	switch {
 	case out.TXT && out.Route:
 		out.Active = true
 	case !out.TXT && !out.Route:
-		out.Error = "Add the TXT and routing records Runex generated, then verify again."
+		if apex {
+			out.Error = "Add the TXT record, then a CNAME to " + shown + ", or A and AAAA records if your provider has no CNAME on @."
+		} else {
+			out.Error = "Add the TXT record and a CNAME to " + shown + ", then verify again."
+		}
 	case !out.TXT:
-		out.Error = "Add the TXT record so Runex can prove you own this domain."
+		out.Error = "Routing is in place. Add the TXT record so Runex can confirm you own this domain."
 	default:
-		shown := targets[0]
-		out.Error = fmt.Sprintf("TXT is present. Point this hostname at %s with a Proxied CNAME.", shown)
+		if apex {
+			out.Error = "TXT is in place. Add a CNAME to " + shown + ", or the A and AAAA records, then verify again."
+		} else {
+			out.Error = "TXT is in place. Add a CNAME pointing at " + shown + "."
+		}
 	}
 	return out
+}
+
+func lookupTXT(ctx context.Context, resolver Resolver, name string) ([]string, error) {
+	return retryDNS(ctx, func() ([]string, error) { return resolver.LookupTXT(ctx, name) })
+}
+
+func lookupCNAME(ctx context.Context, resolver Resolver, name string) (string, error) {
+	return retryDNS(ctx, func() (string, error) { return resolver.LookupCNAME(ctx, name) })
+}
+
+func lookupHost(ctx context.Context, resolver Resolver, name string) ([]string, error) {
+	return retryDNS(ctx, func() ([]string, error) { return resolver.LookupHost(ctx, name) })
+}
+
+func retryDNS[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	var zero T
+	values, err := fn()
+	if err == nil || !temporaryDNS(err) || ctx.Err() != nil {
+		return values, err
+	}
+	timer := time.NewTimer(300 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return zero, ctx.Err()
+	case <-timer.C:
+	}
+	return fn()
+}
+
+var edgeAddrCache struct {
+	sync.Mutex
+	target string
+	at     time.Time
+	v4     []string
+	v6     []string
+}
+
+// LookupEdgeAddresses resolves the platform CNAME target into the A and AAAA
+// addresses a root-domain DNS form can store. Results are cached briefly.
+func LookupEdgeAddresses(ctx context.Context, target string) (v4, v6 []string) {
+	target = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(target), "."))
+	if target == "" {
+		return nil, nil
+	}
+	edgeAddrCache.Lock()
+	if edgeAddrCache.target == target && time.Since(edgeAddrCache.at) < 10*time.Minute {
+		v4 = append([]string(nil), edgeAddrCache.v4...)
+		v6 = append([]string(nil), edgeAddrCache.v6...)
+		edgeAddrCache.Unlock()
+		return v4, v6
+	}
+	edgeAddrCache.Unlock()
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, target)
+	if err != nil || len(ips) == 0 {
+		return nil, nil
+	}
+	for _, ip := range ips {
+		if ip.IP == nil {
+			continue
+		}
+		if v4addr := ip.IP.To4(); v4addr != nil {
+			v4 = append(v4, v4addr.String())
+			continue
+		}
+		v6 = append(v6, ip.IP.String())
+	}
+	v4, v6 = uniqueIPs(v4), uniqueIPs(v6)
+	edgeAddrCache.Lock()
+	edgeAddrCache.target = target
+	edgeAddrCache.at = time.Now()
+	edgeAddrCache.v4 = append([]string(nil), v4...)
+	edgeAddrCache.v6 = append([]string(nil), v6...)
+	edgeAddrCache.Unlock()
+	return v4, v6
+}
+
+func temporaryDNS(err error) bool {
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		return false
+	}
+	return dnsErr.Temporary() || dnsErr.Timeout()
 }
 
 func cleanTargets(raw []string) []string {
@@ -347,7 +493,7 @@ func cleanTargets(raw []string) []string {
 }
 
 func pointsAt(ctx context.Context, resolver Resolver, hostname string, targets []string) bool {
-	if cname, err := resolver.LookupCNAME(ctx, hostname); err == nil {
+	if cname, err := lookupCNAME(ctx, resolver, hostname); err == nil {
 		cname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cname), "."))
 		if cname != "" && !sameHost(cname, hostname) {
 			for _, target := range targets {
@@ -357,7 +503,7 @@ func pointsAt(ctx context.Context, resolver Resolver, hostname string, targets [
 			}
 		}
 	}
-	got, err := resolver.LookupHost(ctx, hostname)
+	got, err := lookupHost(ctx, resolver, hostname)
 	if err != nil || len(got) == 0 {
 		return false
 	}
@@ -366,7 +512,7 @@ func pointsAt(ctx context.Context, resolver Resolver, hostname string, targets [
 	}
 	need := map[string]struct{}{}
 	for _, target := range targets {
-		want, lookErr := resolver.LookupHost(ctx, target)
+		want, lookErr := lookupHost(ctx, resolver, target)
 		if lookErr != nil {
 			continue
 		}

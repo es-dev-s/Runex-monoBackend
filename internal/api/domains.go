@@ -28,7 +28,7 @@ func (s *Server) listDomains(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]domainView, 0, len(items))
 	for _, item := range items {
-		views = append(views, s.viewDomain(item))
+		views = append(views, s.viewDomain(r.Context(), item))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"domains":     views,
@@ -64,7 +64,7 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	if existing, getErr := s.store.GetCustomDomainByHost(r.Context(), hostname); getErr == nil {
 		if existing.UserID == userFrom(r).ID && existing.ProjectID == project.ID && existing.NodeID == node.ID {
-			writeJSON(w, http.StatusOK, map[string]any{"domain": s.viewDomain(existing)})
+			writeJSON(w, http.StatusOK, map[string]any{"domain": s.viewDomain(r.Context(), existing)})
 			return
 		}
 		writeErr(w, http.StatusConflict, "domain_taken", "This domain is already connected to another service.")
@@ -95,7 +95,7 @@ func (s *Server) addDomain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", "Could not add domain")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"domain": s.viewDomain(created)})
+	writeJSON(w, http.StatusCreated, map[string]any{"domain": s.viewDomain(r.Context(), created)})
 }
 
 func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "dns", "Could not check DNS for this domain")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"domain": s.viewDomain(updated)})
+	writeJSON(w, http.StatusOK, map[string]any{"domain": s.viewDomain(r.Context(), updated)})
 }
 
 func (s *Server) deleteDomain(w http.ResponseWriter, r *http.Request) {
@@ -181,13 +181,16 @@ type domainView struct {
 	LastCheckAt *time.Time            `json:"lastCheckAt,omitempty"`
 }
 
-func (s *Server) viewDomain(d store.CustomDomain) domainView {
+func (s *Server) viewDomain(ctx context.Context, d store.CustomDomain) domainView {
 	target := s.cfg.DomainCNAME()
+	records := customdomain.Records(d.Hostname, d.Token, target)
+	v4, v6 := customdomain.LookupEdgeAddresses(ctx, target)
+	records = append(records, customdomain.AddressRecords(d.Hostname, v4, v6)...)
 	view := domainView{
 		ID:          d.ID,
 		Hostname:    d.Hostname,
 		Status:      d.Status,
-		Records:     customdomain.Records(d.Hostname, d.Token, target),
+		Records:     records,
 		Error:       d.LastError,
 		EdgeStatus:  d.EdgeStatus,
 		CNAMETarget: target,
@@ -202,6 +205,10 @@ func (s *Server) viewDomain(d store.CustomDomain) domainView {
 }
 
 func (s *Server) checkCustomDomain(ctx context.Context, d store.CustomDomain) (store.CustomDomain, error) {
+	// Finish the status write even if the browser or the reconcile ticker
+	// cancels the parent context halfway through DNS or Cloudflare.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
 	_ = s.store.SetCustomDomainCheck(ctx, d.ID, customdomain.StatusVerifying, d.LastError, "", false)
 	result := customdomain.Verify(ctx, s.domainResolver(), d.Hostname, d.Token, s.cfg.DomainCNAMETargets()...)
 	status := customdomain.StatusPending
@@ -214,33 +221,21 @@ func (s *Server) checkCustomDomain(ctx context.Context, d store.CustomDomain) (s
 			edgeStatus = published
 		}
 		probe := customdomain.ProbeEdge(ctx, d.Hostname)
-		if published == "provisioned" && (probe.Banned || probe.Tunnel) {
-			probe = customdomain.ProbeEdgeUntilReady(ctx, d.Hostname, 4, 2*time.Second)
-		}
 		switch {
-		case probe.Banned || probe.Tunnel:
-			if pubErr != nil {
-				status = customdomain.StatusError
-				errText = pubErr.Error()
-				break
-			}
-			if published == "provisioned" {
-				status = customdomain.StatusVerifying
-				errText = "Cloudflare is authorizing this hostname. Keep the Proxied CNAME to " + s.cfg.DomainCNAME() + ". This usually takes about a minute."
-				break
-			}
-			status = customdomain.StatusError
-			errText = probe.Detail
-		case pubErr != nil:
+		case pubErr != nil && published != "provisioned":
 			status = customdomain.StatusError
 			errText = pubErr.Error()
-		default:
+		case probe.OK && !probe.Banned && !probe.Tunnel:
 			status = customdomain.StatusActive
 			errText = ""
 			verified = true
+		default:
+			status = customdomain.StatusVerifying
+			errText = "DNS matches. Cloudflare is still issuing the certificate for this hostname. Leave the records in place."
+			if probe.Detail != "" && (probe.Banned || probe.Tunnel) {
+				errText = probe.Detail + " This usually clears within a minute."
+			}
 		}
-	} else if result.Error != "" && (result.TXT || result.Route) {
-		status = customdomain.StatusError
 	}
 	if err := s.store.SetCustomDomainCheck(ctx, d.ID, status, errText, edgeStatus, verified); err != nil {
 		return d, err
@@ -322,7 +317,7 @@ func (s *Server) reconcileDomains(ctx context.Context) {
 		if item.LastCheckAt != nil && time.Since(*item.LastCheckAt) < 20*time.Second {
 			continue
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		checkCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		_, _ = s.checkCustomDomain(checkCtx, item)
 		cancel()
 	}
@@ -345,7 +340,6 @@ func (s *Server) lookupCustomDomain(ctx context.Context, host string) (store.Nod
 	}
 	return s.store.GetNode(ctx, domain.ProjectID, domain.NodeID)
 }
-
 
 func (s *Server) enablePlatformURL(w http.ResponseWriter, r *http.Request) {
 	if s.domainLimit != nil && !s.domainLimit.allow("platform:"+userFrom(r).ID) {

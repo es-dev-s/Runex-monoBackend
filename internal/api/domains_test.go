@@ -10,7 +10,7 @@ import (
 
 func TestViewDomainHidesRawTokenField(t *testing.T) {
 	s := &Server{cfg: config.Config{TunnelCNAME: "abc.cfargotunnel.com", EdgeDomain: "salesradar.live"}}
-	view := s.viewDomain(store.CustomDomain{
+	view := s.viewDomain(t.Context(), store.CustomDomain{
 		ID:       "dom_1",
 		Hostname: "app.example.com",
 		Status:   customdomain.StatusPending,
@@ -25,7 +25,7 @@ func TestViewDomainHidesRawTokenField(t *testing.T) {
 	if view.URL != "" {
 		t.Fatal("pending domains must not get a public URL")
 	}
-	active := s.viewDomain(store.CustomDomain{
+	active := s.viewDomain(t.Context(), store.CustomDomain{
 		ID:       "dom_1",
 		Hostname: "app.example.com",
 		Status:   customdomain.StatusActive,

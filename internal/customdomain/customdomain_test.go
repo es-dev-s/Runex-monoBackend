@@ -57,7 +57,7 @@ func TestPlatformHost(t *testing.T) {
 
 func TestRecordsApexAndSubdomain(t *testing.T) {
 	apex := Records("example.com", "harbor-verify=abc", "cname.salesradar.live")
-	if len(apex) != 2 || apex[0].Type != "TXT" || apex[1].Type != "ALIAS" || apex[1].Host != "@" {
+	if len(apex) != 2 || apex[0].Type != "TXT" || apex[1].Type != "CNAME" || apex[1].Host != "@" {
 		t.Fatalf("apex %#v", apex)
 	}
 	if apex[0].Name != "_harbor-challenge.example.com" {
@@ -69,6 +69,16 @@ func TestRecordsApexAndSubdomain(t *testing.T) {
 	}
 	if sub[0].Host != "_harbor-challenge.www" {
 		t.Fatalf("txt host %s", sub[0].Host)
+	}
+}
+
+func TestAddressRecordsOnlyForApex(t *testing.T) {
+	apex := AddressRecords("example.com", []string{"104.21.65.142", "104.21.65.142"}, []string{"2606:4700:3035::ac43:a3e7"})
+	if len(apex) != 2 || apex[0].Type != "A" || apex[1].Type != "AAAA" || apex[0].Required || apex[0].Host != "@" {
+		t.Fatalf("%#v", apex)
+	}
+	if AddressRecords("www.example.com", []string{"1.2.3.4"}, nil) != nil {
+		t.Fatal("subdomain must not get address records")
 	}
 }
 
