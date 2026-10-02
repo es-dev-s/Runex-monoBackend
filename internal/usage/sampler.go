@@ -34,13 +34,13 @@ type Sampler struct {
 	docker *runtime.Client
 	store  *store.Store
 
-	mu        sync.RWMutex
-	live      map[string]live
-	history   map[string][]Point
-	ticks     int
-	sampled   time.Time
-	strikes   map[string]int
-	onOver    func(ctx context.Context, node store.Node, reason string)
+	mu      sync.RWMutex
+	live    map[string]live
+	history map[string][]Point
+	ticks   int
+	sampled time.Time
+	strikes map[string]int
+	onOver  func(ctx context.Context, node store.Node, reason string)
 }
 
 func New(docker *runtime.Client, st *store.Store) *Sampler {
@@ -73,6 +73,17 @@ func (s *Sampler) Run(ctx context.Context) {
 
 func (s *Sampler) IntervalSeconds() int {
 	return int(interval / time.Second)
+}
+
+// Read returns the latest RAM and CPU sample for one deployment.
+func (s *Sampler) Read(nodeID string) (ram int64, cpu float64) {
+	if s == nil || nodeID == "" {
+		return 0, 0
+	}
+	s.mu.RLock()
+	cur := s.live[nodeID]
+	s.mu.RUnlock()
+	return cur.ram, cur.cpu
 }
 
 func (s *Sampler) tick(ctx context.Context) {

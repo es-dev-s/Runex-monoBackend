@@ -31,8 +31,8 @@ type ctxKey int
 const userCtxKey ctxKey = 1
 
 var (
-	usernameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{2,31}$`)
-	dummyHash  []byte
+	usernameRE    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{2,31}$`)
+	dummyHash     []byte
 	authLimit     = newLimiter(8, 10*time.Minute)
 	registerLimit = newLimiter(3, 10*time.Minute)
 )
@@ -190,6 +190,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid_credentials", "Incorrect username or password")
 		return
 	}
+	if user.RevokedAt != nil {
+		writeErr(w, http.StatusForbidden, "access_revoked", "This account no longer has access to Runex.")
+		return
+	}
 	s.store.PruneExpiredSessions(r.Context())
 	if err := s.issueSession(w, r, user.ID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "session", "Could not start a session")
@@ -204,6 +208,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.DeleteSession(r.Context(), cookie.Value)
 	}
 	s.clearSessionCookie(w, r)
+	s.wakeAdmins()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -275,6 +280,16 @@ func (s *Server) forgetSession(id string) {
 	s.sessionMu.Unlock()
 }
 
+func (s *Server) forgetUserSessions(userID string) {
+	s.sessionMu.Lock()
+	for id, entry := range s.sessions {
+		if entry.user.ID == userID {
+			delete(s.sessions, id)
+		}
+	}
+	s.sessionMu.Unlock()
+}
+
 func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) error {
 	if cookie, err := r.Cookie(sessionCookie); err == nil && cookie.Value != "" {
 		s.forgetSession(cookie.Value)
@@ -285,6 +300,7 @@ func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID str
 		return err
 	}
 	http.SetCookie(w, s.sessionCookieFor(r, id, sessionTTL))
+	s.wakeAdmins()
 	return nil
 }
 
@@ -300,11 +316,16 @@ func publicUser(u store.User) map[string]any {
 	if name == "" {
 		name = u.Username
 	}
+	role := u.Role
+	if role == "" {
+		role = store.RoleUser
+	}
 	return map[string]any{
 		"id":        u.ID,
 		"username":  u.Username,
 		"email":     u.Email,
 		"name":      name,
+		"role":      role,
 		"createdAt": u.CreatedAt,
 	}
 }

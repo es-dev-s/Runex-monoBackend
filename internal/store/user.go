@@ -4,18 +4,40 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"time"
 )
 
+var errNotFound = errors.New("not found")
+
+const (
+	RoleUser  = "user"
+	RoleAdmin = "admin"
+)
+
 type User struct {
-	ID           string    `json:"id"`
-	Username     string    `json:"username"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"`
-	Name         string    `json:"name"`
-	AvatarURL    string    `json:"avatarUrl,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID           string     `json:"id"`
+	Username     string     `json:"username"`
+	Email        string     `json:"email"`
+	PasswordHash string     `json:"-"`
+	Name         string     `json:"name"`
+	AvatarURL    string     `json:"avatarUrl,omitempty"`
+	Role         string     `json:"role"`
+	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+}
+
+// Account is a user as an administrator sees them. It never includes a password.
+type Account struct {
+	ID        string     `json:"id"`
+	Username  string     `json:"username"`
+	Email     string     `json:"email"`
+	Name      string     `json:"name"`
+	Role      string     `json:"role"`
+	CreatedAt time.Time  `json:"createdAt"`
+	RevokedAt *time.Time `json:"revokedAt,omitempty"`
+	SignedIn  bool       `json:"signedIn"`
 }
 
 func NewSessionID() string {
@@ -26,7 +48,7 @@ func NewSessionID() string {
 	return hex.EncodeToString(buf)
 }
 
-const userSelect = `SELECT u.id, u.username, u.email, COALESCE(u.password_hash,''), u.name, u.avatar_url, u.created_at`
+const userSelect = `SELECT u.id, u.username, u.email, COALESCE(u.password_hash,''), u.name, u.avatar_url, COALESCE(u.role,'user'), u.revoked_at, u.created_at`
 
 func (s *Store) CreateUser(ctx context.Context, u User) error {
 	_, err := s.pool.Exec(ctx, `
@@ -66,7 +88,73 @@ func (s *Store) UserBySession(ctx context.Context, sessionID string) (User, erro
 	return scanUser(s.pool.QueryRow(ctx, userSelect+`
 		FROM users u
 		JOIN sessions s ON s.user_id = u.id
-		WHERE s.id=$1 AND s.expires_at > now()`, sessionID))
+		WHERE s.id=$1 AND s.expires_at > now() AND u.revoked_at IS NULL`, sessionID))
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id, u.username, u.email, u.name, COALESCE(u.role,'user'), u.created_at, u.revoked_at,
+		       EXISTS (
+		         SELECT 1 FROM sessions s
+		         WHERE s.user_id = u.id AND s.expires_at > now()
+		       )
+		FROM users u
+		ORDER BY (u.revoked_at IS NOT NULL), lower(u.username)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Account{}
+	for rows.Next() {
+		var item Account
+		if err := rows.Scan(&item.ID, &item.Username, &item.Email, &item.Name, &item.Role, &item.CreatedAt, &item.RevokedAt, &item.SignedIn); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GrantAdmin(ctx context.Context, id, passwordHash string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE users
+		SET password_hash=$2, role=$3, revoked_at=NULL, updated_at=now()
+		WHERE id=$1
+	`, id, passwordHash, RoleAdmin)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errNotFound
+	}
+	return nil
+}
+
+func (s *Store) SetRevoked(ctx context.Context, id string, revoked bool) (Account, error) {
+	var item Account
+	err := s.pool.QueryRow(ctx, `
+		UPDATE users
+		SET revoked_at = CASE WHEN $2 THEN now() ELSE NULL END,
+		    updated_at = now()
+		WHERE id=$1
+		RETURNING id, username, email, name, COALESCE(role,'user'), created_at, revoked_at, false
+	`, id, revoked).Scan(&item.ID, &item.Username, &item.Email, &item.Name, &item.Role, &item.CreatedAt, &item.RevokedAt, &item.SignedIn)
+	return item, err
+}
+
+func (s *Store) DeleteUserSessions(ctx context.Context, userID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id=$1`, userID)
+	return err
+}
+
+func (s *Store) CountActiveAdmins(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(1)::int FROM users
+		WHERE role=$1 AND revoked_at IS NULL
+	`, RoleAdmin).Scan(&n)
+	return n, err
 }
 
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
@@ -152,6 +240,6 @@ func (s *Store) InstallationOwned(ctx context.Context, userID string, id int64) 
 
 func scanUser(row interface{ Scan(dest ...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Name, &u.AvatarURL, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Name, &u.AvatarURL, &u.Role, &u.RevokedAt, &u.CreatedAt)
 	return u, err
 }

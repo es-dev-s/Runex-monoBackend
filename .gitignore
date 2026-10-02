@@ -4,6 +4,7 @@
 /tmp
 .env
 !.env.example
+.admin-seed
 *.pem
 *.log
 .DS_Store

@@ -866,8 +866,8 @@ func (s *Store) OwnedDeployment(ctx context.Context, userID, deploymentID string
 	return d, err
 }
 
-// ListRecentDeploymentLogs returns at most the last hour of one deployment.
-// The read is bounded by deployment_id and ts so Activity never scans the log table.
+// ListRecentDeploymentLogs returns the latest lines for one deployment.
+// The read is bounded by deployment_id so Activity never scans the log table.
 func (s *Store) ListRecentDeploymentLogs(ctx context.Context, projectID, deploymentID string, limit int) ([]LogLine, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 200
@@ -875,7 +875,7 @@ func (s *Store) ListRecentDeploymentLogs(ctx context.Context, projectID, deploym
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, project_id, deployment_id, node_id, ts, phase, level, text
 		FROM deploy_logs
-		WHERE project_id=$1 AND deployment_id=$2 AND ts >= now() - interval '1 hour'
+		WHERE project_id=$1 AND deployment_id=$2
 		ORDER BY id DESC
 		LIMIT $3
 	`, projectID, deploymentID, limit)
