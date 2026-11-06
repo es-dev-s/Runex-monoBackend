@@ -41,6 +41,9 @@ type adminAccount struct {
 	RAMUsedBytes int64          `json:"ramUsedBytes"`
 	CPUPercent   float64        `json:"cpuPercent"`
 	Projects     []adminProject `json:"projects"`
+	Plan         planInfo       `json:"plan"`
+	// PlanChangedAt is when an administrator last switched this plan.
+	PlanChangedAt *time.Time `json:"planChangedAt,omitempty"`
 }
 
 func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +116,9 @@ func (s *Server) watchSession(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	kick := s.subscribeKick(user.ID)
+	// planKey tracks the account's plan so an admin change (or the trial
+	// running out) reaches the open dashboard within a second.
+	planKey := ""
 	defer s.unsubscribeKick(user.ID, kick)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -125,10 +131,18 @@ func (s *Server) watchSession(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		case <-ticker.C:
-			if _, err := s.store.UserBySession(r.Context(), cookie.Value); err != nil {
+			fresh, err := s.store.UserBySession(r.Context(), cookie.Value)
+			if err != nil {
 				fmt.Fprintf(w, "data: %s\n\n", `{"kind":"revoked"}`)
 				flusher.Flush()
 				return
+			}
+			if key := planKeyFor(fresh, time.Now()); key != planKey {
+				if planKey != "" {
+					fmt.Fprintf(w, "data: %s\n\n", `{"kind":"plan"}`)
+					flusher.Flush()
+				}
+				planKey = key
 			}
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
@@ -246,16 +260,18 @@ func assembleDirectory(accounts []store.Account, workloads []store.AdminWorkload
 			role = store.RoleUser
 		}
 		view := adminAccount{
-			ID:        account.ID,
-			Username:  account.Username,
-			Email:     account.Email,
-			Name:      account.Name,
-			Role:      role,
-			CreatedAt: account.CreatedAt,
-			RevokedAt: account.RevokedAt,
-			SignedIn:  account.SignedIn,
-			Days:      daysOnPlatform(account.CreatedAt, now),
-			Projects:  []adminProject{},
+			ID:            account.ID,
+			Username:      account.Username,
+			Email:         account.Email,
+			Name:          account.Name,
+			Role:          role,
+			CreatedAt:     account.CreatedAt,
+			RevokedAt:     account.RevokedAt,
+			SignedIn:      account.SignedIn,
+			Days:          daysOnPlatform(account.CreatedAt, now),
+			Projects:      []adminProject{},
+			Plan:          accountPlan(account, now),
+			PlanChangedAt: account.PlanChangedAt,
 		}
 		for _, id := range order[account.ID] {
 			item := projects[account.ID][id]

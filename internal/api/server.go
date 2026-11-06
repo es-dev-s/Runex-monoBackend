@@ -129,6 +129,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/admin/live", s.adminLive)
 	mux.HandleFunc("POST /v1/admin/users/{id}/revoke", s.adminRevokeUser)
 	mux.HandleFunc("POST /v1/admin/users/{id}/restore", s.adminRestoreUser)
+	mux.HandleFunc("POST /v1/admin/users/{id}/plan", s.adminSetPlan)
 	mux.HandleFunc("GET /v1/secrets", s.secretsBundle)
 	mux.HandleFunc("PUT /v1/secrets/vault", s.putSecretVault)
 	mux.HandleFunc("POST /v1/secrets/vault/attach", s.attachSecretVault)

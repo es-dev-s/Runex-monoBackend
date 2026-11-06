@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -51,6 +52,10 @@ type Account struct {
 	CreatedAt time.Time  `json:"createdAt"`
 	RevokedAt *time.Time `json:"revokedAt,omitempty"`
 	SignedIn  bool       `json:"signedIn"`
+	// Plan inputs. The API derives trial/active/expired from these.
+	TrialStartedAt time.Time  `json:"-"`
+	BillingStatus  string     `json:"-"`
+	PlanChangedAt  *time.Time `json:"-"`
 }
 
 func NewSessionID() string {
@@ -86,6 +91,27 @@ func (s *Store) MarkOnboarded(ctx context.Context, id string) (time.Time, error)
 	var at time.Time
 	err := s.pool.QueryRow(ctx, `UPDATE users SET onboarded_at = COALESCE(onboarded_at, now()), updated_at = now() WHERE id=$1 RETURNING onboarded_at`, id).Scan(&at)
 	return at, err
+}
+
+// SetBillingPlan saves the plan an administrator set for an account:
+// BillingActive (paid, never gated) or BillingTrial. restartTrial starts a fresh
+// trial clock. actorID is recorded with the time for audit.
+// Returns pgx.ErrNoRows when the account does not exist.
+func (s *Store) SetBillingPlan(ctx context.Context, id, status string, restartTrial bool, actorID string) error {
+	if status != BillingTrial && status != BillingActive {
+		return fmt.Errorf("unknown billing status %q", status)
+	}
+	var got string
+	return s.pool.QueryRow(ctx, `
+		UPDATE users
+		SET billing_status = $2,
+		    trial_started_at = CASE WHEN $3 THEN now() ELSE trial_started_at END,
+		    plan_changed_at = now(),
+		    plan_changed_by = NULLIF($4, ''),
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING id
+	`, id, status, restartTrial, actorID).Scan(&got)
 }
 
 // ProjectOwner returns the user that owns a project.
@@ -188,7 +214,8 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 		       EXISTS (
 		         SELECT 1 FROM sessions s
 		         WHERE s.user_id = u.id AND s.expires_at > now()
-		       )
+		       ),
+		       u.trial_started_at, COALESCE(u.billing_status,'trial'), u.plan_changed_at
 		FROM users u
 		ORDER BY (u.revoked_at IS NOT NULL), lower(u.username)
 	`)
@@ -199,7 +226,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	out := []Account{}
 	for rows.Next() {
 		var item Account
-		if err := rows.Scan(&item.ID, &item.Username, &item.Email, &item.Name, &item.Role, &item.CreatedAt, &item.RevokedAt, &item.SignedIn); err != nil {
+		if err := rows.Scan(&item.ID, &item.Username, &item.Email, &item.Name, &item.Role, &item.CreatedAt, &item.RevokedAt, &item.SignedIn, &item.TrialStartedAt, &item.BillingStatus, &item.PlanChangedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

@@ -222,6 +222,9 @@ ALTER TABLE users ALTER COLUMN trial_started_at SET DEFAULT now();
 ALTER TABLE users ALTER COLUMN trial_started_at SET NOT NULL;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_billing_status_check;
 ALTER TABLE users ADD CONSTRAINT users_billing_status_check CHECK (billing_status IN ('trial', 'active'));
+-- Audit for admin plan switches: when and by which administrator.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_changed_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_changed_by TEXT;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin'));
 
