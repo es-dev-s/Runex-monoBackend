@@ -94,6 +94,7 @@ func main() {
 	go sampler.Run(ctx)
 	apiSrv := api.New(cfg, st, engine, hub, ch, sampler)
 	go apiSrv.WatchDomains(ctx)
+	go apiSrv.WatchTrials(ctx)
 	server := api.NewHTTPServer(cfg, apiSrv.Handler())
 	log.Info("data stores", "postgres", "ok", "cache", ch.Backend())
 

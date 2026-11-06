@@ -31,6 +31,8 @@ type Config struct {
 	RedisURL               string
 	WorkDir                string
 	DetectorURL            string
+	GoogleClientID         string
+	GoogleClientSecret     string
 	GitHubToken            string
 	GitHubAppID            string
 	GitHubAppSlug          string
@@ -90,6 +92,8 @@ func Load() Config {
 		RedisURL:               loadRedisURL(),
 		WorkDir:                env("PLATFORM_WORKDIR", "data"),
 		DetectorURL:            env("DETECTION_ENGINE_URL", "http://127.0.0.1:8090"),
+		GoogleClientID:         env("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret:     env("GOOGLE_CLIENT_SECRET", ""),
 		GitHubToken:            env("GITHUB_TOKEN", os.Getenv("GITHUB_TOKEN")),
 		GitHubAppID:            env("GITHUB_APP_ID", ""),
 		GitHubAppSlug:          env("GITHUB_APP_SLUG", ""),

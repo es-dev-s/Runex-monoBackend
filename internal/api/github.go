@@ -409,6 +409,16 @@ func (s *Server) redeployPush(evt githubapp.PushEvent) {
 		if err != nil {
 			continue
 		}
+		if !s.computeAllowedFor(ctx, project.ID) {
+			s.hub.Publish(project.ID, logs.Line{
+				Kind:   "log",
+				Phase:  "build",
+				Level:  "warn",
+				Text:   "GitHub push on " + evt.Branch + " skipped: the free trial has ended. Contact support to deploy again.",
+				NodeID: node.ID,
+			})
+			continue
+		}
 		branch := evt.Branch
 		if node.GitHubBranch != nil && strings.TrimSpace(*node.GitHubBranch) != "" {
 			branch = strings.TrimSpace(*node.GitHubBranch)

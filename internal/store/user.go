@@ -23,10 +23,23 @@ type User struct {
 	PasswordHash string     `json:"-"`
 	Name         string     `json:"name"`
 	AvatarURL    string     `json:"avatarUrl,omitempty"`
+	Theme        string     `json:"theme,omitempty"`
 	Role         string     `json:"role"`
 	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
+	// TrialStartedAt starts the free trial clock. Nil only on a struct built in memory before insert.
+	TrialStartedAt *time.Time `json:"-"`
+	// OnboardedAt is set once the user dismisses the first-run welcome.
+	OnboardedAt *time.Time `json:"-"`
+	// BillingStatus is "trial" or "active". Support sets "active" for paying accounts.
+	BillingStatus string `json:"-"`
 }
+
+// Billing statuses stored in users.billing_status.
+const (
+	BillingTrial  = "trial"
+	BillingActive = "active"
+)
 
 // Account is a user as an administrator sees them. It never includes a password.
 type Account struct {
@@ -48,18 +61,96 @@ func NewSessionID() string {
 	return hex.EncodeToString(buf)
 }
 
-const userSelect = `SELECT u.id, u.username, u.email, COALESCE(u.password_hash,''), u.name, u.avatar_url, COALESCE(u.role,'user'), u.revoked_at, u.created_at`
+const userSelect = `SELECT u.id, u.username, u.email, COALESCE(u.password_hash,''), u.name, u.avatar_url, COALESCE(u.theme,''), COALESCE(u.role,'user'), u.revoked_at, u.created_at, u.trial_started_at, u.onboarded_at, COALESCE(u.billing_status,'trial')`
 
 func (s *Store) CreateUser(ctx context.Context, u User) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO users (id, username, email, password_hash, name)
-		VALUES ($1,$2,$3,$4,$5)
-	`, u.ID, u.Username, strings.ToLower(strings.TrimSpace(u.Email)), u.PasswordHash, u.Name)
+		INSERT INTO users (id, username, email, password_hash, name, avatar_url)
+		VALUES ($1,$2,$3,$4,$5,$6)
+	`, u.ID, u.Username, strings.ToLower(strings.TrimSpace(u.Email)), u.PasswordHash, u.Name, u.AvatarURL)
 	return err
 }
 
 func (s *Store) UserByID(ctx context.Context, id string) (User, error) {
 	return scanUser(s.pool.QueryRow(ctx, userSelect+` FROM users u WHERE u.id=$1`, id))
+}
+
+// UserByEmail deliberately does not match usernames when resolving an OAuth identity.
+func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
+	return scanUser(s.pool.QueryRow(ctx, userSelect+` FROM users u WHERE lower(u.email)=$1`, strings.ToLower(strings.TrimSpace(email))))
+}
+
+// MarkOnboarded records that the user finished the first-run welcome. It is
+// idempotent: the first timestamp wins, so double clicks and retries are safe.
+func (s *Store) MarkOnboarded(ctx context.Context, id string) (time.Time, error) {
+	var at time.Time
+	err := s.pool.QueryRow(ctx, `UPDATE users SET onboarded_at = COALESCE(onboarded_at, now()), updated_at = now() WHERE id=$1 RETURNING onboarded_at`, id).Scan(&at)
+	return at, err
+}
+
+// ProjectOwner returns the user that owns a project.
+func (s *Store) ProjectOwner(ctx context.Context, projectID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(user_id,'') FROM projects WHERE id=$1`, projectID).Scan(&id)
+	return id, err
+}
+
+// ListTrialEndedUsers returns accounts whose free trial is over and that support
+// has not marked active. Their compute must stay stopped.
+func (s *Store) ListTrialEndedUsers(ctx context.Context, trialDays int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id FROM users
+		WHERE COALESCE(billing_status,'trial') <> 'active'
+		  AND trial_started_at + make_interval(days => $1) <= now()`, trialDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// SetUserTheme stores the dashboard appearance the user picked ("system", "light", or "dark").
+func (s *Store) SetUserTheme(ctx context.Context, id, theme string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE users SET theme=$2, updated_at=now() WHERE id=$1`, id, theme)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errNotFound
+	}
+	return nil
+}
+
+// RefreshOAuthProfile keeps the photo current and fills a missing display name.
+// A name the user already has is never overwritten.
+func (s *Store) RefreshOAuthProfile(ctx context.Context, id, name, avatarURL string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE users
+		SET avatar_url = CASE WHEN $3 <> '' THEN $3 ELSE avatar_url END,
+		    name = CASE WHEN btrim(name) = '' AND $2 <> '' THEN $2 ELSE name END,
+		    updated_at = now()
+		WHERE id=$1 AND (($3 <> '' AND avatar_url IS DISTINCT FROM $3) OR (btrim(name) = '' AND $2 <> ''))
+	`, id, strings.TrimSpace(name), strings.TrimSpace(avatarURL))
+	return err
+}
+
+// ReplaceGeneratedUsername swaps an opaque generated handle (for example
+// google_<hex>) for a readable one. It only touches rows that still carry the
+// expected old handle, so a concurrent rename can never be overwritten.
+func (s *Store) ReplaceGeneratedUsername(ctx context.Context, id, from, to string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE users SET username=$3, updated_at=now() WHERE id=$1 AND username=$2`, id, from, to)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func (s *Store) UserByLogin(ctx context.Context, login string) (User, error) {
@@ -240,6 +331,6 @@ func (s *Store) InstallationOwned(ctx context.Context, userID string, id int64) 
 
 func scanUser(row interface{ Scan(dest ...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Name, &u.AvatarURL, &u.Role, &u.RevokedAt, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Name, &u.AvatarURL, &u.Theme, &u.Role, &u.RevokedAt, &u.CreatedAt, &u.TrialStartedAt, &u.OnboardedAt, &u.BillingStatus)
 	return u, err
 }

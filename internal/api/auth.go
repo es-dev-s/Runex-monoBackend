@@ -77,6 +77,8 @@ func authPublic(r *http.Request) bool {
 		return true
 	case r.Method == http.MethodPost && (path == "/v1/auth/register" || path == "/v1/auth/login"):
 		return true
+	case r.Method == http.MethodGet && (path == "/v1/auth/google" || path == "/v1/auth/google/callback"):
+		return true
 	case r.Method == http.MethodGet && path == "/v1/github/setup":
 		return true
 	default:
@@ -321,13 +323,57 @@ func publicUser(u store.User) map[string]any {
 		role = store.RoleUser
 	}
 	return map[string]any{
-		"id":        u.ID,
-		"username":  u.Username,
-		"email":     u.Email,
-		"name":      name,
-		"role":      role,
-		"createdAt": u.CreatedAt,
+		"id":          u.ID,
+		"username":    u.Username,
+		"email":       u.Email,
+		"name":        name,
+		"role":        role,
+		"avatarUrl":   u.AvatarURL,
+		"theme":       u.Theme,
+		"hasPassword": u.PasswordHash != "",
+		"createdAt":   u.CreatedAt,
+		"plan":        planFor(u, time.Now()),
+		"onboarded":   u.OnboardedAt != nil,
 	}
+}
+
+// completeOnboarding records that the user dismissed the first-run welcome, on
+// the account so other browsers never show it again.
+func (s *Server) completeOnboarding(w http.ResponseWriter, r *http.Request) {
+	user := userFrom(r)
+	at, err := s.store.MarkOnboarded(r.Context(), user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", "Could not save your progress")
+		return
+	}
+	user.OnboardedAt = &at
+	s.forgetUserSessions(user.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+}
+
+// updatePreferences saves per-account dashboard settings. Only the theme is
+// stored today; an empty value means the user has not chosen yet.
+func (s *Server) updatePreferences(w http.ResponseWriter, r *http.Request) {
+	user := userFrom(r)
+	var body struct {
+		Theme *string `json:"theme"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body); err != nil || body.Theme == nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "A theme is required")
+		return
+	}
+	theme := strings.TrimSpace(*body.Theme)
+	if theme != "system" && theme != "light" && theme != "dark" {
+		writeErr(w, http.StatusBadRequest, "invalid_theme", "Theme must be system, light, or dark")
+		return
+	}
+	if err := s.store.SetUserTheme(r.Context(), user.ID, theme); err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", "Could not save your appearance")
+		return
+	}
+	s.forgetUserSessions(user.ID)
+	user.Theme = theme
+	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
 }
 
 func validateUsername(raw string) error {

@@ -118,8 +118,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/github/complete", s.githubComplete)
 	mux.HandleFunc("POST /v1/auth/register", s.register)
 	mux.HandleFunc("POST /v1/auth/login", s.login)
+	mux.HandleFunc("GET /v1/auth/google", s.googleLogin)
+	mux.HandleFunc("GET /v1/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("POST /v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /v1/auth/me", s.me)
+	mux.HandleFunc("PATCH /v1/auth/me/preferences", s.updatePreferences)
+	mux.HandleFunc("POST /v1/auth/me/onboarding", s.completeOnboarding)
 	mux.HandleFunc("GET /v1/auth/watch", s.watchSession)
 	mux.HandleFunc("GET /v1/admin/users", s.adminListUsers)
 	mux.HandleFunc("GET /v1/admin/live", s.adminLive)
@@ -422,6 +426,9 @@ func (s *Server) startProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	if !s.requireCompute(w, r) {
+		return
+	}
 	nodeID := strings.TrimSpace(r.URL.Query().Get("nodeId"))
 	if nodeID != "" {
 		node, err := s.store.GetNode(r.Context(), project.ID, nodeID)
@@ -516,6 +523,9 @@ func (s *Server) addNode(w http.ResponseWriter, r *http.Request) {
 			existing, _ := s.store.ListNodes(r.Context(), project.ID)
 			node.X, node.Y = nextServicePoint(existing)
 		}
+	}
+	if (kind == "postgresql" || kind == "redis") && !s.requireCompute(w, r) {
+		return
 	}
 	if kind == "postgresql" || kind == "redis" {
 		node.Status = "building"
@@ -669,6 +679,9 @@ func (s *Server) deployGitHub(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	if !s.requireCompute(w, r) {
+		return
+	}
 	var body githubBody
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "JSON body with url or repo is required")
@@ -746,6 +759,9 @@ func (s *Server) deployZip(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	if !s.requireCompute(w, r) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadBytes)
 	if err := r.ParseMultipartForm(s.cfg.MaxUploadBytes); err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "Zip exceeds upload limit")
@@ -801,6 +817,9 @@ func (s *Server) deployZip(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deployHTML(w http.ResponseWriter, r *http.Request) {
 	project, err := s.loadProject(w, r)
 	if err != nil {
+		return
+	}
+	if !s.requireCompute(w, r) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadBytes)
@@ -883,6 +902,9 @@ func (s *Server) finishStaging(w http.ResponseWriter, r *http.Request, project s
 func (s *Server) deployNode(w http.ResponseWriter, r *http.Request) {
 	project, err := s.loadProject(w, r)
 	if err != nil {
+		return
+	}
+	if !s.requireCompute(w, r) {
 		return
 	}
 	node, err := s.store.GetNode(r.Context(), project.ID, r.PathValue("nodeId"))
@@ -1600,6 +1622,9 @@ func (s *Server) deleteVar(w http.ResponseWriter, r *http.Request) {
 func (s *Server) applyVars(w http.ResponseWriter, r *http.Request) {
 	project, err := s.loadProject(w, r)
 	if err != nil {
+		return
+	}
+	if !s.requireCompute(w, r) {
 		return
 	}
 	if err := s.engine.ApplyEnv(r.Context(), project.ID, strings.TrimSpace(r.URL.Query().Get("node"))); err != nil {

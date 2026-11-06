@@ -209,6 +209,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username)
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users (lower(email));
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS theme TEXT NOT NULL DEFAULT '';
+-- Billing: every account gets a 30-day free trial from trial_started_at.
+-- billing_status 'active' is set by support for paying accounts and lifts the trial limit.
+-- Accounts that existed before this column get a fresh 30 days from the migration and
+-- are treated as already onboarded, so nobody is locked or shown the welcome by surprise.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_status TEXT NOT NULL DEFAULT 'trial';
+UPDATE users SET trial_started_at = now(), onboarded_at = COALESCE(onboarded_at, now()) WHERE trial_started_at IS NULL;
+ALTER TABLE users ALTER COLUMN trial_started_at SET DEFAULT now();
+ALTER TABLE users ALTER COLUMN trial_started_at SET NOT NULL;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_billing_status_check;
+ALTER TABLE users ADD CONSTRAINT users_billing_status_check CHECK (billing_status IN ('trial', 'active'));
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin'));
 

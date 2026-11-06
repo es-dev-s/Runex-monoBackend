@@ -19,6 +19,15 @@ func (s *Server) sessionCookie(value string, ttl time.Duration) *http.Cookie {
 func (s *Server) sessionCookieFor(r *http.Request, value string, ttl time.Duration) *http.Cookie {
 	c := s.newCookieFor(r, sessionCookie, value, ttl)
 	s.relaxCookieForOrigin(r, c)
+	// Google returns through the same-origin Next rewrite. Do not inherit a
+	// production cookie domain or Secure setting when signing in on localhost.
+	if r != nil && r.URL.Path == "/v1/auth/google/callback" {
+		if origin, err := googleWebOrigin(r); err == nil {
+			c.Domain = ""
+			c.Secure = strings.HasPrefix(origin, "https://")
+			c.SameSite = http.SameSiteLaxMode
+		}
+	}
 	return c
 }
 
